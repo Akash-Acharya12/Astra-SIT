@@ -23,6 +23,13 @@ from storage import (
     TransactionError,
 )
 
+try:
+    from recovery import RecoveryError
+except (ImportError, AttributeError):
+    class RecoveryError(DatabaseCorruptedError):
+        """Raised when log recovery encounters unrecoverable corruption."""
+        pass
+
 # --- Official Constraints ---
 MAX_KEY_SIZE = 1024          # 1 to 1,024 bytes (1 KB)
 MAX_VALUE_SIZE = 1048576      # 0 to 1,048,576 bytes (1 MB)
@@ -156,24 +163,42 @@ class AstraDB:
                 self._storage.open()
 
                 # 3. Crash Recovery Integration
-                # RecoveryManager is assigned to teammate Dakshin (recovery.py)
+                safe_truncation_point = None
                 self._index = None
+                has_recovery = False
+
                 try:
                     import recovery
                     if hasattr(recovery, "RecoveryManager") and hasattr(recovery.RecoveryManager, "recover"):
-                        self._index, _ = recovery.RecoveryManager.recover(self._storage)
+                        has_recovery = True
+                        self._index, safe_truncation_point = recovery.RecoveryManager.recover(self._storage)
                 except (ImportError, AttributeError):
                     pass
 
-                # If recovery is not yet implemented by Dakshin, initialize fresh index
                 if self._index is None:
                     self._index = MemoryIndex()
 
-                # 4. Initialize Batch Manager
-                self._batch_mgr = BatchManager()
+                # 4. Validate boundary and truncate the log if necessary
+                current_eof = self._storage.get_eof()
+                if safe_truncation_point is not None:
+                    if not (0 <= safe_truncation_point <= current_eof):
+                        raise DatabaseCorruptedError(
+                            f"Invalid safe_truncation_point {safe_truncation_point} "
+                            f"(current log EOF is {current_eof})."
+                        )
+                    if safe_truncation_point < current_eof:
+                        self._storage.truncate(safe_truncation_point)
 
+                # 5. Initialize BatchManager and restore transaction ID using maximum retained tx_id
+                self._batch_mgr = BatchManager()
+                if has_recovery and hasattr(recovery.RecoveryManager, "get_max_tx_id"):
+                    max_tx_id = recovery.RecoveryManager.get_max_tx_id(self._storage)
+                    self._batch_mgr.set_starting_tx_id(max_tx_id)
+
+                # 6. Only then mark the database open
                 self._is_open = True
                 self._is_poisoned = False
+
 
             except Exception:
                 if self._storage:
@@ -449,6 +474,7 @@ __all__ = [
     "AstraError",
     "KeyNotFoundError",
     "DatabaseCorruptedError",
+    "RecoveryError",
     "DatabaseLockedError",
     "TransactionError",
     "DatabaseClosedError",
